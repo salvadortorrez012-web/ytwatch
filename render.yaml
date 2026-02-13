@@ -9,11 +9,22 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+
+      # ── OBLIGATORIAS (rellena manualmente en Render Dashboard) ────────────────
       - key: RESEND_API_KEY
-        sync: false        # Lo introduces tú manualmente en el dashboard
+        sync: false        # Tu API key de https://resend.com/api-keys
+
       - key: NOTIFY_EMAIL
-        sync: false
+        sync: false        # Email donde recibir las alertas
+
+      # ── OPCIONALES ────────────────────────────────────────────────────────────
+      # "onboarding@resend.dev" funciona sin verificar dominio,
+      # pero solo puede enviar al email con el que creaste la cuenta en Resend.
+      # Para enviar a cualquier email, verifica tu dominio en Resend y pon
+      # algo como: notif@tudominio.com
       - key: FROM_EMAIL
         value: onboarding@resend.dev
+
+      # Intervalo de revisión en minutos (mínimo: 5)
       - key: CHECK_INTERVAL_MIN
         value: "15"

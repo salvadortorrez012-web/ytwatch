@@ -1,18 +1,16 @@
 {
   "name": "ytwatch",
-  "version": "1.0.0",
-  "description": "YouTube RSS Monitor con notificaciones por email via Resend",
+  "version": "5.0.0",
+  "description": "Monitor de YouTube vía RSS con notificaciones por email (Resend). Sin YouTube API key. Diseñado para Render free tier.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node index.js"
+    "dev":   "node index.js"
   },
   "engines": {
     "node": ">=18.0.0"
   },
-  "dependencies": {
-    "fast-xml-parser": "^4.3.6"
-  },
-  "keywords": ["youtube", "rss", "monitor", "notifications"],
+  "dependencies": {},
+  "keywords": ["youtube", "rss", "monitor", "notifications", "resend", "render"],
   "license": "MIT"
 }
