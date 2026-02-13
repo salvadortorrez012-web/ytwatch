@@ -195,338 +195,263 @@ let state     = loadState();
  * GET request con soporte de redirecciones y timeout.
  * Lanza un Error si el request falla — el caller hace catch.
  */
-function httpGet(url, timeoutMs = 20_000) {
+function httpsGet(url, timeoutMs = 20000) {
   return new Promise((resolve, reject) => {
-    const mod = url.startsWith("https") ? https : http;
-    const req = mod.get(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; YTWatch/5.0; +https://github.com)",
-        "Accept":     "application/rss+xml, application/xml, text/xml, */*",
-      },
-    }, (res) => {
-      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
-        req.destroy();
-        return httpGet(res.headers.location, timeoutMs).then(resolve).catch(reject);
+    const req = https.get(url, { timeout: timeoutMs }, (res) => {
+      // Manejar redirecciones 3xx
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        resolve(httpsGet(res.headers.location, timeoutMs));
+        return;
       }
-      const chunks = [];
-      res.on("data", (c) => chunks.push(c));
-      res.on("end",  () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString("utf8") }));
-      res.on("error", reject);
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => resolve({ status: res.statusCode, body }));
     });
     req.on("error", reject);
-    req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error(`Timeout (${timeoutMs / 1000}s)`)); });
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error(`Timeout tras ${timeoutMs}ms`));
+    });
   });
 }
 
 /**
- * GET con reintentos automáticos (backoff exponencial).
- * Intenta hasta `retries` veces antes de lanzar el error final.
+ * POST request con soporte de timeout.
+ * Usado solo para Resend (envío de emails).
  */
-async function httpGetWithRetry(url, retries = 2) {
-  let lastError;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      return await httpGet(url);
-    } catch (e) {
-      lastError = e;
-      if (attempt < retries) {
-        const wait = (attempt + 1) * 3_000; // 3s, 6s
-        console.warn(`[HTTP] Intento ${attempt + 1} fallido (${e.message}) — reintentando en ${wait / 1000}s`);
-        await sleep(wait);
-      }
-    }
-  }
-  throw lastError;
-}
-
-// ─── YOUTUBE RSS FEED ─────────────────────────────────────────────────────────
-/**
- * Descarga y parsea el feed RSS de un canal.
- * Devuelve array de videos (máx 15 — límite de YouTube RSS).
- *
- * Posibles errores manejados:
- *  - 404: Channel ID incorrecto
- *  - Red/timeout: reintenta 2 veces
- *  - XML inválido / feed vacío
- *  - Videos privados/eliminados (no tienen yt:videoId)
- */
-async function fetchVideos(channelId, channelName) {
-  const { status, body } = await httpGetWithRetry(YT_RSS(channelId));
-
-  if (status === 404) {
-    throw new Error(`Channel ID inválido: "${channelId}" (404). ¿Empieza con "UC" y tiene 24 chars?`);
-  }
-  if (status === 429) {
-    throw new Error(`Rate limit de YouTube (429). Aumenta CHECK_INTERVAL_MIN.`);
-  }
-  if (status !== 200) {
-    throw new Error(`YouTube RSS respondió HTTP ${status}`);
-  }
-  if (!body.trim().startsWith("<?xml") && !body.trim().startsWith("<feed")) {
-    throw new Error(`Respuesta inválida — no es XML. ¿YouTube bloqueó la request?`);
-  }
-  if (!body.includes("<entry>")) {
-    return []; // Canal sin videos publicados
-  }
-
-  const entries = xmlEntries(body);
-
-  return entries.map((entry) => {
-    const videoId   = xmlTag(entry, "yt:videoId");
-    const titleRaw  = xmlTag(entry, "title");
-    const title     = decodeHtml(titleRaw);
-    const link      = getLinkHref(entry) || `https://www.youtube.com/watch?v=${videoId}`;
-    const published = xmlTag(entry, "published");
-    const thumbnail = xmlAttr(entry, "media:thumbnail", "url")
-                   || `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
-    const author    = xmlTag(xmlTag(entry, "author"), "name") // <author><name>X</name></author>
-                   || xmlTag(entry, "name")
-                   || channelName;
-
-    return { videoId, title, link, published, thumbnail, channelName: channelName || author, channelId };
-  }).filter((v) => v.videoId && v.title); // Descartar videos sin ID (privados/eliminados)
-}
-
-// ─── EMAIL VIA RESEND ─────────────────────────────────────────────────────────
-function sendEmail(to, subject, html, text) {
-  return new Promise((resolve) => {
-    if (!RESEND_API_KEY) {
-      console.warn("[Email] RESEND_API_KEY no configurada — email omitido");
-      return resolve({ ok: false, reason: "no_api_key" });
-    }
-    const payload = JSON.stringify({ from: FROM_EMAIL, to: [to], subject, html, text });
-
-    const req = https.request({
-      hostname: "api.resend.com",
-      path:     "/emails",
-      method:   "POST",
-      headers: {
-        "Authorization":  `Bearer ${RESEND_API_KEY}`,
-        "Content-Type":   "application/json",
-        "Content-Length": Buffer.byteLength(payload),
-      },
-    }, (res) => {
-      let body = "";
-      res.on("data", (c) => body += c);
-      res.on("end", () => {
-        const ok = res.statusCode === 200 || res.statusCode === 201;
-        if (ok) {
-          try { const d = JSON.parse(body); console.log(`[Email] ✅ Enviado | id: ${d.id}`); }
-          catch { console.log("[Email] ✅ Enviado"); }
-          resolve({ ok: true });
-        } else {
-          let detail = body;
-          try {
-            const d = JSON.parse(body);
-            // Resend devuelve { name, message, statusCode } en errores
-            detail = d.message || d.name || body;
-          } catch { /* usa body raw */ }
-          console.error(`[Email] ❌ Error HTTP ${res.statusCode}: ${detail}`);
-          resolve({ ok: false, reason: `HTTP ${res.statusCode}: ${detail}` });
-        }
-      });
+function httpsPost(hostname, path, headers, body, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      hostname, path, method: "POST", headers,
+      timeout: timeoutMs,
+    };
+    const req = https.request(opts, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => resolve({ status: res.statusCode, body: data }));
     });
-    req.on("error", (e) => {
-      console.error("[Email] Error de red:", e.message);
-      resolve({ ok: false, reason: e.message });
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error(`Timeout tras ${timeoutMs}ms`));
     });
-    req.write(payload);
+    req.write(body);
     req.end();
   });
 }
 
-// ─── PLANTILLA DE EMAIL ───────────────────────────────────────────────────────
+// ─── RESEND ────────────────────────────────────────────────────────────────────
+/**
+ * Envía un email via Resend API.
+ * Retorna { ok: true } o { ok: false, reason: "..." }
+ */
+async function sendEmail(to, subject, htmlBody, textBody) {
+  if (!RESEND_API_KEY) return { ok: false, reason: "RESEND_API_KEY no configurada" };
+  if (!to)             return { ok: false, reason: "Email destino vacío" };
+
+  const payload = JSON.stringify({
+    from: FROM_EMAIL,
+    to: [to],
+    subject,
+    html: htmlBody,
+    text: textBody || "",
+  });
+
+  try {
+    const res = await httpsPost(
+      "api.resend.com",
+      "/emails",
+      {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload),
+        "Authorization": `Bearer ${RESEND_API_KEY}`,
+      },
+      payload
+    );
+    if (res.status >= 200 && res.status < 300) return { ok: true };
+    let err = `HTTP ${res.status}`;
+    try {
+      const json = JSON.parse(res.body);
+      if (json.message) err += ` — ${json.message}`;
+    } catch { /* si no es JSON, dejamos el mensaje genérico */ }
+    return { ok: false, reason: err };
+  } catch (e) {
+    return { ok: false, reason: e.message };
+  }
+}
+
+// ─── TEMPLATES DE EMAIL ────────────────────────────────────────────────────────
 function buildEmailHtml(v) {
   return `<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-</head>
-<body style="margin:0;padding:0;background:#0a0a0a;font-family:'Segoe UI',Arial,sans-serif;">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0a;padding:32px 16px;">
-<tr><td align="center">
-<table width="600" cellpadding="0" cellspacing="0"
-  style="background:#141414;border-radius:16px;overflow:hidden;border:1px solid #2a2a2a;max-width:600px;width:100%;">
-
-  <!-- Header -->
-  <tr><td style="background:#ff0000;padding:16px 28px;">
-    <table width="100%"><tr>
-      <td style="color:#fff;font-size:20px;font-weight:700;letter-spacing:-0.5px;">▶ YTWatch</td>
-      <td align="right" style="color:rgba(255,255,255,0.8);font-size:12px;">Nuevo video</td>
-    </tr></table>
-  </td></tr>
-
-  <!-- Canal -->
-  <tr><td style="padding:22px 28px 0;">
-    <span style="background:rgba(255,0,0,0.15);color:#ff6b6b;border-radius:20px;padding:5px 14px;font-size:12px;font-weight:700;">
-      📺 ${escHtml(v.channelName)}
-    </span>
-  </td></tr>
-
-  <!-- Título -->
-  <tr><td style="padding:14px 28px 0;">
-    <h1 style="margin:0;color:#f0f0f0;font-size:19px;font-weight:700;line-height:1.35;">${escHtml(v.title)}</h1>
-  </td></tr>
-
-  <!-- Fecha -->
-  <tr><td style="padding:8px 28px 0;">
-    <p style="margin:0;color:#888;font-size:13px;">📅 ${escHtml(formatDate(v.published))}</p>
-  </td></tr>
-
-  <!-- Thumbnail clicable -->
-  <tr><td style="padding:18px 28px;">
-    <a href="${escHtml(v.link)}" style="display:block;text-decoration:none;">
-      <img src="${escHtml(v.thumbnail)}" alt="${escHtml(v.title)}"
-        style="width:100%;display:block;border-radius:10px;border:2px solid #2a2a2a;" />
-    </a>
-  </td></tr>
-
-  <!-- Link del video -->
-  <tr><td style="padding:0 28px;">
-    <div style="background:#1e1e1e;border:1px solid #2a2a2a;border-radius:10px;padding:12px 16px;">
-      <p style="margin:0 0 4px;color:#666;font-size:10px;text-transform:uppercase;letter-spacing:1px;">Enlace del video</p>
-      <a href="${escHtml(v.link)}" style="color:#60a5fa;font-size:13px;font-family:monospace;word-break:break-all;text-decoration:none;">${escHtml(v.link)}</a>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:sans-serif;max-width:600px;margin:40px auto;padding:0 20px;background:#fafafa">
+  <div style="background:#fff;border-radius:8px;padding:30px;box-shadow:0 2px 10px rgba(0,0,0,0.1)">
+    <h2 style="margin:0 0 20px;color:#333">📹 Nuevo video en YouTube</h2>
+    <div style="background:#f0f0f0;border-radius:8px;padding:20px;margin-bottom:20px">
+      <div style="font-size:18px;font-weight:600;color:#000;margin-bottom:8px">${escHtml(v.title)}</div>
+      <div style="font-size:14px;color:#666;margin-bottom:12px">${escHtml(v.channelName)}</div>
+      ${v.thumbnail ? `<img src="${escHtml(v.thumbnail)}" alt="Thumbnail" style="width:100%;border-radius:6px;margin-bottom:12px">` : ""}
+      <div style="font-size:13px;color:#888;margin-bottom:16px">${formatDate(v.published)}</div>
+      <a href="${escHtml(v.link)}" style="display:inline-block;background:#ff0000;color:#fff;text-decoration:none;padding:12px 24px;border-radius:6px;font-weight:600">▶️ Ver en YouTube</a>
     </div>
-  </td></tr>
-
-  <!-- Botón CTA -->
-  <tr><td style="padding:22px 28px 28px;text-align:center;">
-    <a href="${escHtml(v.link)}"
-      style="display:inline-block;background:#ff0000;color:#fff;font-weight:700;font-size:15px;
-             text-decoration:none;border-radius:10px;padding:14px 36px;">
-      ▶ Ver video ahora
-    </a>
-  </td></tr>
-
-  <!-- Footer -->
-  <tr><td style="background:#0d0d0d;padding:14px 28px;border-top:1px solid #2a2a2a;">
-    <p style="margin:0;color:#444;font-size:11px;text-align:center;">
-      YTWatch · revisión cada ${CHECK_MINUTES} min · vía RSS público de YouTube
-    </p>
-  </td></tr>
-
-</table>
-</td></tr>
-</table>
+    <div style="font-size:12px;color:#999;margin-top:20px;padding-top:20px;border-top:1px solid #eee">
+      <p style="margin:0">Este mensaje fue enviado por <b>YTWatch</b> porque el canal <b>${escHtml(v.channelName)}</b> publicó un nuevo video.</p>
+    </div>
+  </div>
 </body>
 </html>`;
 }
 
 function buildEmailText(v) {
-  return `Nuevo video de ${v.channelName}\n\nTítulo: ${v.title}\nPublicado: ${formatDate(v.published)}\nLink: ${v.link}\n\n--\nYTWatch · revisión cada ${CHECK_MINUTES} min`;
+  return `📹 Nuevo video en YouTube
+
+${v.title}
+
+Canal: ${v.channelName}
+Publicado: ${formatDate(v.published)}
+
+▶️ Ver en YouTube:
+${v.link}
+
+────────────────────────────────────────
+Este mensaje fue enviado por YTWatch porque el canal "${v.channelName}" publicó un nuevo video.
+`;
 }
 
-// ─── LOG DE ACTIVIDAD ─────────────────────────────────────────────────────────
-const activityLog = [];
-let isChecking    = false;
-let lastCheck     = null;
-let nextCheck     = null;
-let checksTotal   = 0;
-let notifTotal    = 0;
+// ─── CORE: REVISIÓN DE CANALES ────────────────────────────────────────────────
+let isChecking   = false;
+let checksTotal  = 0;
+let lastCheck    = null;
+let nextCheck    = null;
+let notifTotal   = 0;
+let activityLog  = [];
 
 function log(msg, type = "info") {
-  const entry = { time: new Date().toISOString(), msg, type };
-  activityLog.unshift(entry);
-  if (activityLog.length > 200) activityLog.pop();
-  const labels = { info: "INFO", success: " OK ", warn: "WARN", error: " ERR" };
-  console.log(`[${labels[type] || "INFO"}] ${msg}`);
+  const now = new Date().toISOString();
+  console.log(`[${now.split("T")[1].slice(0, 8)}] ${msg}`);
+  activityLog.unshift({ time: now, msg, type });
+  if (activityLog.length > 100) activityLog.pop(); // Mantener solo los últimos 100
 }
 
-// ─── LOOP DE MONITOREO ────────────────────────────────────────────────────────
+/**
+ * Revisa todos los canales configurados.
+ * Marca como "ya vistos" los videos en la primera pasada (sin notificar).
+ * En revisiones posteriores, notifica solo los videos NUEVOS.
+ */
 async function checkAllChannels() {
-  // Prevenir ejecuciones simultáneas (JS es single-threaded pero el flag
-  // se revisa antes del primer await, así que es seguro)
-  if (isChecking) { log("Revisión en curso — saltando ciclo", "warn"); return; }
+  if (isChecking) return; // Ya hay una revisión en curso
+  isChecking = true;
 
-  channels = loadChannels(); // Recarga channels.json por si cambió (sin reiniciar)
-  if (channels.length === 0) {
-    log("channels.json vacío — agrega canales al archivo", "warn");
-    lastCheck = new Date().toISOString();
-    return;
+  const startTime = Date.now();
+  checksTotal++;
+  const isFirstRun = Object.keys(state.seen).length === 0; // Primera vez que arranca
+
+  if (isFirstRun) {
+    log("🚀 Primera pasada — marcando videos actuales como vistos (sin notificar)");
+  } else {
+    log(`🔍 Revisando ${channels.length} canal(es)...`);
   }
 
-  isChecking  = true;
-  lastCheck   = new Date().toISOString();
-  checksTotal++;
-  log(`Revisando ${channels.length} canal(es)...`);
-
-  let newThisRound = 0;
+  let newVideosCount = 0;
 
   for (const ch of channels) {
     try {
-      const videos = await fetchVideos(ch.id, ch.name);
-      // Limpiar error previo si esta revisión fue exitosa
+      const url = YT_RSS(ch.id);
+      const { status, body } = await httpsGet(url, 15000);
+
+      if (status !== 200) {
+        const msg = `HTTP ${status}`;
+        state.errors[ch.id] = { msg, time: Date.now() };
+        log(`⚠️ [${ch.name}] Error: ${msg}`, "warn");
+        saveState(state);
+        continue;
+      }
+
+      // Limpiar error previo si ahora funcionó
       if (state.errors[ch.id]) {
         delete state.errors[ch.id];
-        log(`[${ch.name}] Recuperado — feed accesible de nuevo`, "success");
-      }
-
-      if (!state.seen[ch.id]) {
-        // PRIMERA REVISIÓN para este canal:
-        // Marcar todos como vistos sin notificar (evitar spam de videos viejos)
-        state.seen[ch.id] = videos.map((v) => v.videoId);
         saveState(state);
-        log(`[${ch.name}] Primera revisión — ${videos.length} videos registrados como vistos (sin notificar)`);
+      }
+
+      const entries = xmlEntries(body);
+      if (!entries.length) {
+        log(`[${ch.name}] Sin videos en el feed`, "info");
         continue;
       }
 
-      const seenSet = new Set(state.seen[ch.id]);
-      // Videos no vistos, ordenados del más antiguo al más nuevo
-      const newVids = videos.filter((v) => !seenSet.has(v.videoId)).reverse();
+      // Procesar cada video del feed (YouTube RSS devuelve los 15 más recientes)
+      for (const entry of entries) {
+        const videoId   = xmlTag(entry, "yt:videoId");
+        const title     = decodeHtml(xmlTag(entry, "title"));
+        const link      = getLinkHref(entry) || `https://www.youtube.com/watch?v=${videoId}`;
+        const published = xmlTag(entry, "published");
+        const thumbnail = xmlAttr(entry, "media:thumbnail", "url");
 
-      if (newVids.length === 0) {
-        log(`[${ch.name}] Sin videos nuevos`);
-        continue;
-      }
+        if (!videoId) continue; // XML malformado
 
-      for (const vid of newVids) {
-        log(`🎬 NUEVO VIDEO: "${vid.title}" — ${vid.channelName}`, "success");
-        newThisRound++;
-        notifTotal++;
+        // ¿Ya vimos este video?
+        if (state.seen[videoId]) continue;
 
-        if (NOTIFY_EMAIL) {
-          const subject = `📹 Nuevo video de ${vid.channelName}: ${vid.title}`;
-          const result  = await sendEmail(NOTIFY_EMAIL, subject, buildEmailHtml(vid), buildEmailText(vid));
-          if (result.ok) {
-            log(`[${ch.name}] 📧 Email enviado`, "success");
-          } else {
-            log(`[${ch.name}] ⚠️ Email fallido: ${result.reason}`, "error");
-          }
+        // Marcar como visto
+        state.seen[videoId] = { channelId: ch.id, channelName: ch.name, time: Date.now() };
+
+        // ¿Primera pasada? → No notificar
+        if (isFirstRun) {
+          continue;
+        }
+
+        // ¡Video nuevo! → Enviar email
+        newVideosCount++;
+        log(`🆕 [${ch.name}] ${title}`, "success");
+
+        const emailData = {
+          videoId, title, link, published, thumbnail,
+          channelName: ch.name,
+          channelId:   ch.id,
+        };
+
+        const emailResult = await sendEmail(
+          NOTIFY_EMAIL,
+          `🔔 ${ch.name} subió un nuevo video`,
+          buildEmailHtml(emailData),
+          buildEmailText(emailData)
+        );
+
+        if (emailResult.ok) {
+          notifTotal++;
+          log(`✅ Email enviado → ${NOTIFY_EMAIL}`, "success");
         } else {
-          log("NOTIFY_EMAIL no configurado — email omitido", "warn");
+          log(`❌ Fallo al enviar email: ${emailResult.reason}`, "error");
         }
-
-        // Marcar como visto aunque el email haya fallado
-        // (para no reenviar el mismo video en el próximo ciclo)
-        state.seen[ch.id].push(vid.videoId);
-        if (state.seen[ch.id].length > 100) {
-          state.seen[ch.id] = state.seen[ch.id].slice(-100);
-        }
-        saveState(state);
-
-        // Pequeña pausa entre emails (no saturar Resend API)
-        if (newVids.indexOf(vid) < newVids.length - 1) await sleep(1500);
       }
 
-    } catch (err) {
-      const msg = err.message || String(err);
-      log(`[${ch.name}] ❌ Error: ${msg}`, "error");
-      state.errors[ch.id] = { msg, time: new Date().toISOString() };
+      saveState(state); // Guardar tras cada canal (evita perder progreso si crashea)
+      await sleep(500); // Delay cortés entre canales
+    } catch (e) {
+      const msg = e.message || "Error desconocido";
+      state.errors[ch.id] = { msg, time: Date.now() };
+      log(`❌ [${ch.name}] Excepción: ${msg}`, "error");
       saveState(state);
     }
   }
 
-  nextCheck  = new Date(Date.now() + CHECK_INTERVAL).toISOString();
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+  if (isFirstRun) {
+    log(`✅ Primera pasada completa (${elapsed}s) — listo para detectar nuevos videos`);
+  } else if (newVideosCount > 0) {
+    log(`✅ Revisión completa (${elapsed}s) — ${newVideosCount} video(s) nuevo(s)`, "success");
+  } else {
+    log(`✅ Revisión completa (${elapsed}s) — sin videos nuevos`);
+  }
+
+  lastCheck  = Date.now();
+  nextCheck  = lastCheck + CHECK_INTERVAL;
   isChecking = false;
-  log(
-    newThisRound > 0
-      ? `✅ Revisión completa — ${newThisRound} video(s) nuevo(s) | Próxima: ${new Date(nextCheck).toLocaleTimeString("es-ES")}`
-      : `Sin videos nuevos | Próxima revisión: ${new Date(nextCheck).toLocaleTimeString("es-ES")}`
-  );
 }
 
-// ─── DASHBOARD HTML ───────────────────────────────────────────────────────────
+// ─── DASHBOARD HTML ────────────────────────────────────────────────────────────
 function getDashboardHtml() {
   return `<!DOCTYPE html>
 <html lang="es">
@@ -535,166 +460,129 @@ function getDashboardHtml() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>YTWatch</title>
 <style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --bg:#0a0a0a; --s1:#141414; --s2:#1e1e1e;
-    --b: #2a2a2a; --red:#ff0000; --t: #f0f0f0;
-    --m: #888;    --g: #4ade80; --y: #fbbf24;
-    --blue: #60a5fa;
-  }
-  body   { font-family:'Segoe UI',system-ui,sans-serif; background:var(--bg); color:var(--t); min-height:100vh; }
-
-  /* Header */
-  header { background:var(--s1); border-bottom:1px solid var(--b); padding:0 24px; height:56px;
-           display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:10; }
-  .logo  { display:flex; align-items:center; gap:10px; font-size:17px; font-weight:700; }
-  .logo-box { background:var(--red); color:#fff; width:28px; height:28px; border-radius:7px;
-              display:flex; align-items:center; justify-content:center; font-size:12px; flex-shrink:0; }
-  .pill { border-radius:20px; padding:4px 12px; font-size:12px; font-weight:600; }
-  .pill-ok  { background:rgba(74,222,128,.1); color:var(--g); border:1px solid rgba(74,222,128,.25); }
-  .pill-chk { background:rgba(96,165,250,.1); color:var(--blue); border:1px solid rgba(96,165,250,.25); }
-
-  /* Layout */
-  main { max-width:1000px; margin:0 auto; padding:22px 18px; }
-
-  /* Alerts */
-  .alert { border-radius:10px; padding:12px 16px; font-size:13px; line-height:1.7; margin-bottom:18px; display:none; }
-  .alert b { color:inherit; font-weight:700; }
-  .warn  { background:rgba(251,191,36,.07); border:1px solid rgba(251,191,36,.25); color:var(--y); }
-  .good  { background:rgba(74,222,128,.07); border:1px solid rgba(74,222,128,.25); color:var(--g); }
-
-  /* Stats */
-  .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px,1fr)); gap:12px; margin-bottom:20px; }
-  .stat  { background:var(--s1); border:1px solid var(--b); border-radius:13px; padding:18px; text-align:center; }
-  .sn    { font-size:26px; font-weight:700; color:var(--red); margin-bottom:3px; line-height:1; }
-  .sl    { font-size:11px; color:var(--m); text-transform:uppercase; letter-spacing:.5px; }
-
-  /* Grid */
-  .g2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px; }
-  @media(max-width:600px){ .g2 { grid-template-columns:1fr; } }
-
-  /* Cards */
-  .card  { background:var(--s1); border:1px solid var(--b); border-radius:13px; padding:18px; }
-  .ctit  { font-size:11px; color:var(--m); text-transform:uppercase; letter-spacing:.8px; font-weight:600; margin-bottom:12px; }
-
-  /* Canales */
-  .chi   { display:flex; align-items:flex-start; justify-content:space-between; gap:10px;
-           padding:10px 12px; background:var(--s2); border-radius:9px; margin-bottom:7px; }
-  .chname { font-size:13px; font-weight:600; margin-bottom:2px; }
-  .chid   { font-size:10px; color:#555; font-family:monospace; }
-  .cherr  { font-size:10px; color:var(--y); margin-top:3px; }
-  .badge-ok  { background:rgba(74,222,128,.1); color:var(--g); border-radius:6px; padding:2px 8px; font-size:10px; font-weight:700; flex-shrink:0; }
-  .badge-err { background:rgba(251,191,36,.1); color:var(--y); border-radius:6px; padding:2px 8px; font-size:10px; font-weight:700; flex-shrink:0; }
-
-  /* Botones */
-  button { border:none; border-radius:9px; padding:9px 16px; cursor:pointer; font-size:13px;
-           font-weight:600; transition:opacity .15s; width:100%; }
-  button:hover:not(:disabled) { opacity:.8; }
-  button:disabled { opacity:.45; cursor:not-allowed; }
-  .btn-r { background:var(--red); color:#fff; }
-  .btn-g { background:rgba(74,222,128,.1); border:1px solid rgba(74,222,128,.25); color:var(--g); margin-top:7px; }
-  .btn-d { background:var(--s2); border:1px solid var(--b); color:var(--t); margin-top:7px; }
-
-  /* Info */
-  .info-box { background:var(--s2); border:1px solid var(--b); border-radius:9px; padding:12px 14px;
-              font-size:12px; color:#aaa; line-height:1.75; margin-top:14px; }
-  .info-box code { background:#2a2a2a; padding:1px 6px; border-radius:4px; font-family:monospace; color:var(--blue); font-size:11px; }
-
-  /* Log */
-  .log-wrap { max-height:340px; overflow-y:auto; }
-  .log-wrap::-webkit-scrollbar { width:3px; }
-  .log-wrap::-webkit-scrollbar-thumb { background:#333; border-radius:2px; }
-  .li    { font-size:12px; padding:5px 10px; border-radius:7px; margin-bottom:4px; font-family:monospace; line-height:1.5; }
-  .info  { background:#191919; color:#666; }
-  .success { background:#0a1a0a; color:var(--g); }
-  .warn2   { background:#1a1600; color:var(--y); }
-  .error   { background:#1a0a0a; color:#f87171; }
-  .mt8 { margin-top:8px; }
-  .empty { color:#555; font-size:13px; padding:6px 0; }
-
-  /* Toast */
-  .toast { position:fixed; bottom:22px; right:22px; padding:11px 16px; border-radius:10px;
-           font-size:13px; font-weight:600; z-index:999; max-width:300px; animation:su .2s ease; }
-  .t-ok  { background:#0a1a0a; border:1px solid rgba(74,222,128,.4); color:var(--g); }
-  .t-err { background:#1a0a0a; border:1px solid rgba(248,113,113,.4); color:#f87171; }
-  @keyframes su { from { transform:translateY(12px); opacity:0; } to { transform:translateY(0); opacity:1; } }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#0d0d0d; color:#fff; }
+.container { max-width:1200px; margin:0 auto; padding:20px; }
+header { display:flex; justify-content:space-between; align-items:center; margin-bottom:30px; }
+header h1 { display:flex; align-items:center; gap:10px; font-size:28px; }
+.logo { width:40px; height:40px; background:#ff0000; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:20px; }
+.pill { display:inline-block; padding:6px 14px; border-radius:20px; font-size:13px; font-weight:600; }
+.pill-ok  { background:#1a472a; color:#4ade80; }
+.pill-chk { background:#3a3a1a; color:#facc15; }
+.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:15px; margin-bottom:30px; }
+.stat { background:#1a1a1a; padding:20px; border-radius:12px; border:1px solid #2a2a2a; }
+.stat-label { font-size:13px; color:#888; margin-bottom:6px; }
+.stat-value { font-size:24px; font-weight:700; color:#fff; }
+.card { background:#1a1a1a; border:1px solid #2a2a2a; border-radius:12px; padding:25px; margin-bottom:20px; }
+.card h2 { font-size:18px; margin-bottom:15px; display:flex; align-items:center; gap:8px; }
+.warn { background:#3a1a1a; border:1px solid #5a2a2a; padding:15px; border-radius:8px; margin-bottom:15px; color:#fca5a5; }
+.good { background:#1a3a1a; border:1px solid #2a5a2a; padding:15px; border-radius:8px; margin-bottom:15px; color:#86efac; }
+.actions { display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap; }
+.btn { background:#2a2a2a; color:#fff; border:1px solid #3a3a3a; padding:10px 20px; border-radius:8px; cursor:pointer; font-size:14px; font-weight:600; transition:all .2s; }
+.btn:hover:not(:disabled) { background:#3a3a3a; border-color:#4a4a4a; }
+.btn:disabled { opacity:.5; cursor:not-allowed; }
+.btn-primary { background:#ff0000; border-color:#ff0000; }
+.btn-primary:hover:not(:disabled) { background:#cc0000; }
+.btn-success { background:#16a34a; border-color:#16a34a; }
+.btn-success:hover:not(:disabled) { background:#15803d; }
+.chi { display:flex; justify-content:space-between; align-items:center; padding:12px; background:#0a0a0a; border-radius:8px; margin-bottom:8px; }
+.chname { font-weight:600; margin-bottom:3px; }
+.chid { font-size:12px; color:#666; font-family:monospace; }
+.cherr { font-size:12px; color:#fca5a5; margin-top:4px; }
+.badge-ok  { background:#1a472a; color:#4ade80; padding:4px 12px; border-radius:12px; font-size:12px; font-weight:600; }
+.badge-err { background:#5a1a1a; color:#fca5a5; padding:4px 12px; border-radius:12px; font-size:12px; font-weight:600; }
+.li { padding:10px; background:#0a0a0a; border-radius:6px; margin-bottom:6px; font-size:13px; font-family:monospace; }
+.li.success { border-left:3px solid #4ade80; }
+.li.warn2   { border-left:3px solid #facc15; }
+.li.error   { border-left:3px solid #f87171; }
+.li.info    { border-left:3px solid #60a5fa; }
+.empty { color:#666; text-align:center; padding:30px; }
+.add-info { background:#0a0a0a; padding:15px; border-radius:8px; margin-top:15px; font-size:13px; color:#888; }
+.add-info code { background:#1a1a1a; padding:2px 6px; border-radius:4px; color:#60a5fa; font-family:monospace; }
+#toast { position:fixed; bottom:20px; right:20px; background:#1a1a1a; color:#fff; padding:15px 20px; border-radius:8px; border:1px solid #2a2a2a; display:none; z-index:1000; }
+#toast.show { display:block; animation:slideIn .3s; }
+@keyframes slideIn { from { transform:translateY(20px); opacity:0; } to { transform:translateY(0); opacity:1; } }
 </style>
 </head>
 <body>
 
-<header>
-  <div class="logo">
-    <div class="logo-box">▶</div>
-    YTWatch
-  </div>
-  <span class="pill pill-ok" id="hstatus">● Activo</span>
-</header>
-
-<main>
-  <div class="alert warn" id="warn"></div>
-  <div class="alert good" id="good"></div>
+<div class="container">
+  <header>
+    <h1><span class="logo">▶</span> YTWatch</h1>
+    <span id="hstatus" class="pill pill-ok">● Activo</span>
+  </header>
 
   <div class="stats">
-    <div class="stat"><div class="sn" id="s-ch">—</div><div class="sl">Canales</div></div>
-    <div class="stat"><div class="sn" id="s-last">—</div><div class="sl">Última revisión</div></div>
-    <div class="stat"><div class="sn" id="s-next">—</div><div class="sl">Próxima revisión</div></div>
-    <div class="stat"><div class="sn" id="s-notif">—</div><div class="sl">Notif. enviadas</div></div>
-    <div class="stat"><div class="sn" id="s-email">—</div><div class="sl">Email activo</div></div>
+    <div class="stat"><div class="stat-label">CANALES</div><div class="stat-value" id="s-ch">-</div></div>
+    <div class="stat"><div class="stat-label">ÚLTIMA REVISIÓN</div><div class="stat-value" id="s-last">-</div></div>
+    <div class="stat"><div class="stat-label">PRÓXIMA REVISIÓN</div><div class="stat-value" id="s-next">-</div></div>
+    <div class="stat"><div class="stat-label">NOTIF. ENVIADAS</div><div class="stat-value" id="s-notif">-</div></div>
+    <div class="stat"><div class="stat-label">EMAIL ACTIVO</div><div class="stat-value" id="s-email">-</div></div>
   </div>
 
-  <div class="g2">
-    <div class="card">
-      <div class="ctit">📋 Canales monitoreados</div>
-      <div id="ch-list"><p class="empty">Cargando...</p></div>
+  <div id="warn" class="warn" style="display:none"></div>
+  <div id="good" class="good" style="display:none"></div>
+
+  <div class="card">
+    <h2>⚙️ ACCIONES</h2>
+    <div class="actions">
+      <button class="btn btn-primary" id="btn-check" onclick="doCheck()">⟳ Revisar ahora</button>
+      <button class="btn btn-success" id="btn-test" onclick="doTest()">📧 Enviar email de prueba</button>
+      <button class="btn" onclick="location.reload()">🔄 Refrescar página</button>
     </div>
-    <div class="card">
-      <div class="ctit">⚙️ Acciones</div>
-      <button class="btn-r" id="btn-check" onclick="doCheck()">⟳ Revisar ahora</button>
-      <button class="btn-g" id="btn-test"  onclick="doTest()">📧 Enviar email de prueba</button>
-      <button class="btn-d"                onclick="location.reload()">↻ Refrescar página</button>
-      <div class="info-box">
-        <b style="color:#ccc;">Agregar canales:</b><br>
-        Edita <code>channels.json</code> en tu repo y haz commit.<br>
-        Render redespliega automáticamente.<br><br>
-        <code>[{"id":"UCxxxx","name":"Nombre"}]</code>
-      </div>
+    <div class="add-info">
+      <strong>Agregar canales:</strong><br>
+      Edita <code>channels.json</code> en tu repo y haz commit.<br>
+      Render redespliega automáticamente.<br><br>
+      <code>[{"id":"UCxxxx","name":"Nombre"}]</code>
     </div>
   </div>
 
   <div class="card">
-    <div class="ctit">📜 Log de actividad</div>
-    <div class="log-wrap">
-      <div id="log-list"><p class="empty">Sin actividad aún</p></div>
-    </div>
+    <h2>📺 CANALES MONITOREADOS</h2>
+    <div id="ch-list"><p class="empty">Cargando...</p></div>
   </div>
-</main>
+
+  <div class="card">
+    <h2>📋 LOG DE ACTIVIDAD</h2>
+    <div id="log-list"><p class="empty">Sin actividad aún</p></div>
+  </div>
+</div>
+
+<div id="toast"></div>
 
 <script>
-  function ago(iso) {
-    if (!iso) return "—";
-    const s = Math.floor((Date.now() - new Date(iso)) / 1000);
-    if (s <  5)     return "ahora";
-    if (s < 60)     return "hace " + s + "s";
-    if (s < 3600)   return "hace " + Math.floor(s/60) + "min";
-    if (s < 86400)  return "hace " + Math.floor(s/3600) + "h";
-    return "hace " + Math.floor(s/86400) + "d";
+  function safe(s) { 
+    return String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); 
   }
-  function until(iso) {
-    if (!iso) return "—";
-    const s = Math.floor((new Date(iso) - Date.now()) / 1000);
-    if (s <= 0) return "ahora";
-    if (s < 60) return "en " + s + "s";
-    return "en " + Math.floor(s/60) + "min";
+  
+  function ago(t) {
+    if (!t) return "Nunca";
+    const s = Math.floor((Date.now() - t) / 1000);
+    if (s < 60) return "Hace " + s + "s";
+    const m = Math.floor(s / 60);
+    if (m < 60) return "Hace " + m + " min";
+    const h = Math.floor(m / 60);
+    return "Hace " + h + " h";
   }
+  
+  function until(t) {
+    if (!t) return "-";
+    const s = Math.floor((t - Date.now()) / 1000);
+    if (s < 0) return "Ya";
+    if (s < 60) return s + "s";
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + " min";
+    const h = Math.floor(m / 60);
+    return h + " h";
+  }
+  
   function toast(msg, ok) {
-    const t = document.createElement("div");
-    t.className = "toast " + (ok ? "t-ok" : "t-err");
+    const t = document.getElementById("toast");
     t.textContent = msg;
-    document.body.appendChild(t);
-    setTimeout(() => t.remove(), 5000);
-  }
-  function safe(s) {
-    return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    t.style.borderColor = ok ? "#16a34a" : "#dc2626";
+    t.className = "show";
+    setTimeout(() => t.className = "", 4000);
   }
 
   async function load() {
@@ -703,8 +591,13 @@ function getDashboardHtml() {
 
       // Header
       const hs = document.getElementById("hstatus");
-      if (d.isChecking) { hs.textContent = "⟳ Revisando..."; hs.className = "pill pill-chk"; }
-      else              { hs.textContent = "● Activo";        hs.className = "pill pill-ok"; }
+      if (d.isChecking) {
+        hs.textContent = "⟳ Revisando...";
+        hs.className = "pill pill-chk";
+      } else {
+        hs.textContent = "● Activo";
+        hs.className = "pill pill-ok";
+      }
 
       // Stats
       document.getElementById("s-ch").textContent    = d.channels.length;
@@ -715,9 +608,10 @@ function getDashboardHtml() {
 
       // Alertas
       const warns = [];
-      if (!d.resendKey)    warns.push("⚠️ <b>RESEND_API_KEY</b> no configurada → Render › Environment Variables");
-      if (!d.notifyEmail)  warns.push("⚠️ <b>NOTIFY_EMAIL</b> no configurada → Render › Environment Variables");
+      if (!d.resendKey)       warns.push("⚠️ <b>RESEND_API_KEY</b> no configurada → Render › Environment Variables");
+      if (!d.notifyEmail)     warns.push("⚠️ <b>NOTIFY_EMAIL</b> no configurada → Render › Environment Variables");
       if (!d.channels.length) warns.push("⚠️ <b>channels.json</b> está vacío — edita el archivo en tu repo");
+      
       const we = document.getElementById("warn");
       we.innerHTML     = warns.join("<br>");
       we.style.display = warns.length ? "block" : "none";
@@ -726,7 +620,9 @@ function getDashboardHtml() {
       if (!warns.length && d.channels.length) {
         ge.textContent   = "✅ Todo configurado — monitoreando " + d.channels.length + " canal(es)";
         ge.style.display = "block";
-      } else { ge.style.display = "none"; }
+      } else {
+        ge.style.display = "none";
+      }
 
       // Canales
       document.getElementById("ch-list").innerHTML = d.channels.length
@@ -736,7 +632,7 @@ function getDashboardHtml() {
               '<div class="chname">' + safe(c.name) + '</div>' +
               '<div class="chid">' + safe(c.id) + '</div>' +
               (err ? '<div class="cherr">⚠ ' + safe(err.msg) + '</div>' : '') +
-              '</div><span class="' + (err ? "badge-err">⚠ Error" : 'badge-ok">activo') + '</span></div>';
+              '</div><span class="' + (err ? 'badge-err">⚠ Error' : 'badge-ok">activo') + '</span></div>';
           }).join("")
         : '<p class="empty">Sin canales — edita channels.json en GitHub</p>';
 
@@ -749,26 +645,45 @@ function getDashboardHtml() {
           ).join("")
         : '<p class="empty">Sin actividad</p>';
 
-    } catch(e) { console.error("Error:", e); }
+    } catch(e) {
+      console.error("Error cargando dashboard:", e);
+      toast("❌ Error al cargar datos", false);
+    }
   }
 
   async function doCheck() {
     const b = document.getElementById("btn-check");
-    b.textContent = "Revisando..."; b.disabled = true;
-    await fetch("/api/check", { method: "POST" }).catch(() => {});
-    setTimeout(() => { load(); b.textContent = "⟳ Revisar ahora"; b.disabled = false; }, 5000);
+    b.textContent = "Revisando...";
+    b.disabled = true;
+    try {
+      await fetch("/api/check", { method: "POST" });
+      toast("✅ Revisión iniciada", true);
+    } catch(e) {
+      toast("❌ Error al iniciar revisión", false);
+    }
+    setTimeout(() => {
+      load();
+      b.textContent = "⟳ Revisar ahora";
+      b.disabled = false;
+    }, 5000);
   }
+  
   async function doTest() {
     const b = document.getElementById("btn-test");
-    b.textContent = "Enviando..."; b.disabled = true;
+    b.textContent = "Enviando...";
+    b.disabled = true;
     try {
       const d = await fetch("/api/test-email", { method: "POST" }).then(r => r.json());
       toast(d.ok ? "✅ Email enviado a " + d.sentTo + " — revisa tu bandeja" : "❌ " + d.error, d.ok);
-    } catch { toast("❌ Error de conexión", false); }
-    b.textContent = "📧 Enviar email de prueba"; b.disabled = false;
+    } catch(e) {
+      toast("❌ Error de conexión", false);
+    }
+    b.textContent = "📧 Enviar email de prueba";
+    b.disabled = false;
     setTimeout(load, 1500);
   }
 
+  // Cargar al inicio y cada 6 segundos
   load();
   setInterval(load, 6000);
 </script>
