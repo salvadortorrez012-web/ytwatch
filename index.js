@@ -4,6 +4,12 @@
  * No API keys de YouTube necesarias. 100% gratuito.
  */
 
+/**
+ * YTWatch — YouTube RSS Monitor + Email Notifier
+ * Stack: Node.js + Resend API + Render.com (free)
+ * No API keys de YouTube necesarias. 100% gratuito.
+ */
+
 const https = require("https");
 const http = require("http");
 const fs = require("fs");
@@ -58,32 +64,71 @@ function httpGet(url) {
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
 
 async function fetchChannelVideos(channelId) {
-  const url = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
-  try {
-    const { body } = await httpGet(url);
-    const xml = parser.parse(body);
-    const feed = xml?.feed;
-    if (!feed) return [];
+  const rssFeedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
 
-    const entries = Array.isArray(feed.entry) ? feed.entry : feed.entry ? [feed.entry] : [];
-    const channelName = feed.author?.name || feed.title || channelId;
+  // Lista de URLs a intentar en orden (proxies como fallback)
+  const urlsToTry = [
+    rssFeedUrl,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(rssFeedUrl)}`,
+    `https://corsproxy.io/?${encodeURIComponent(rssFeedUrl)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(rssFeedUrl)}`,
+  ];
 
-    return entries.map((e) => {
-      const videoId = e["yt:videoId"] || "";
-      return {
-        videoId,
-        title:       e.title || "Sin título",
-        link:        `https://www.youtube.com/watch?v=${videoId}`,
-        thumbnail:   `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
-        published:   e.published || "",
-        channelName,
-        channelId,
-      };
-    });
-  } catch (err) {
-    console.error(`[RSS] Error en canal ${channelId}:`, err.message);
-    return [];
+  let lastError = null;
+
+  for (const url of urlsToTry) {
+    try {
+      console.log(`[RSS] Intentando: ${url.substring(0, 80)}...`);
+      const { body, status } = await httpGet(url);
+
+      if (status !== 200 || !body || body.trim().length < 50) {
+        console.warn(`[RSS] Respuesta vacía o error ${status} desde ${url.substring(0, 60)}`);
+        continue;
+      }
+
+      const xml = parser.parse(body);
+      const feed = xml?.feed;
+      if (!feed) {
+        console.warn(`[RSS] XML inválido desde ${url.substring(0, 60)}`);
+        continue;
+      }
+
+      const entries = Array.isArray(feed.entry)
+        ? feed.entry
+        : feed.entry
+        ? [feed.entry]
+        : [];
+
+      if (!entries.length) {
+        console.warn(`[RSS] Sin entries para canal ${channelId}`);
+        // Canal válido pero sin videos — devolver array vacío igual
+        return [];
+      }
+
+      const channelName = feed.author?.name || feed.title || channelId;
+      console.log(`[RSS] ✅ OK — ${channelName} (${entries.length} videos) via ${url.substring(0, 50)}`);
+
+      return entries.map((e) => {
+        const videoId = e["yt:videoId"] || "";
+        return {
+          videoId,
+          title:       e.title || "Sin título",
+          link:        `https://www.youtube.com/watch?v=${videoId}`,
+          thumbnail:   `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
+          published:   e.published || "",
+          channelName,
+          channelId,
+        };
+      });
+
+    } catch (err) {
+      lastError = err;
+      console.warn(`[RSS] Falló ${url.substring(0, 60)}: ${err.message}`);
+    }
   }
+
+  console.error(`[RSS] ❌ Todos los intentos fallaron para canal ${channelId}:`, lastError?.message);
+  return [];
 }
 
 // ─── EMAIL VIA RESEND ─────────────────────────────────────────────────────────
