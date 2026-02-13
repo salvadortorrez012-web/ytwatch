@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: ytwatch
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: RESEND_API_KEY
+        sync: false        # Lo introduces tú manualmente en el dashboard
+      - key: NOTIFY_EMAIL
+        sync: false
+      - key: FROM_EMAIL
+        value: onboarding@resend.dev
+      - key: CHECK_INTERVAL_MIN
+        value: "15"
